@@ -103,33 +103,38 @@ def get_adios2_var(filestr, varstr):
     return var
 
 def get_adios2_var_step(filestr, varstr, step):
-    f=adios2.FileReader(filestr)
-    vars=f.available_variables()
-    ct=vars[varstr].get("Shape")
-    ct=[int(i) for i in ct.split(',')]
-    data = f.read(varstr, start=[0]*len(ct), count=ct, step_selection=[step, 1])
-    f.close()
+    with adios2.FileReader(filestr) as f:
+        vars=f.available_variables()
+        shape_str = vars[varstr].get("Shape")
+    
+        if shape_str == "": # scalar
+            count = []
+            start = []
+        else:
+            count = [int(i) for i in shape_str.split(',') if i.strip()]
+            start = [0] * len(count)
+    
+        data = f.read(varstr, start=start, count=count, step_selection=[step, 1])
+        
     return data
 
 def get_adios2_var_allstep(filestr, varstr):
-    f=adios2.FileReader(filestr)
-    vars=f.available_variables()
-    stc=vars[varstr].get("AvailableStepsCount")
-    ct=vars[varstr].get("Shape")
-    stc=int(stc)
+    with adios2.FileReader(filestr) as f:
+        vars=f.available_variables()
+        stc=vars[varstr].get("AvailableStepsCount")
+        ct=vars[varstr].get("Shape")
+        stc=int(stc)
 
-    if ct!='':
-        c=[int(i) for i in ct.split(',')]  #
-        if len(c)==1 :
-            return np.reshape(f.read(varstr, start=[0],    count=c, step_selection=[0,stc]), [stc, c[0]])
-        elif len(c)==2 :
-            return np.reshape(f.read(varstr, start=[0,0],  count=c, step_selection=[0,stc]), [stc, c[0], c[1]])
-        elif ( len(c)==3 ):
-            return np.reshape(f.read(varstr, start=[0,0,0],count=c, step_selection=[0,stc]), [stc, c[0], c[1], c[2]])
-    else:
-        return f.read(varstr, step_selection=[0,stc]) 
-
-
+        if ct!='':
+            c=[int(i) for i in ct.split(',')]  #
+            if len(c)==1 :
+                return np.reshape(f.read(varstr, start=[0],    count=c, step_selection=[0,stc]), [stc, c[0]])
+            elif len(c)==2 :
+                return np.reshape(f.read(varstr, start=[0,0],  count=c, step_selection=[0,stc]), [stc, c[0], c[1]])
+            elif ( len(c)==3 ):
+                return np.reshape(f.read(varstr, start=[0,0,0],count=c, step_selection=[0,stc]), [stc, c[0], c[1], c[2]])
+        else:
+            return f.read(varstr, step_selection=[0,stc])
 
 def get_3d_array(dir_run, step, varstr, header='3d', op_name="0th plane", verbose=True):
     operations = {"0th plane": lambda v: v[0,:],
@@ -210,6 +215,19 @@ def get_OMP_index(xr, isurf, LFS=True):
     
     return inode_idx_omp
 
+def get_OMP_index_inode(xr, inodes, LFS=True):
+    if LFS:
+        msk_lfs = (xr.mesh.r[inodes] > xr.eq_axis_r)
+    else:
+        msk_lfs = (xr.mesh.r[inodes] < xr.eq_axis_r)
+    
+    idx = np.argmin(abs(xr.mesh.z[inodes[msk_lfs]]-xr.eq_axis_z))
+    idx_omp = inodes[msk_lfs][idx]
+    inode_idx_omp = np.argmin(abs(inodes-idx_omp))
+    
+    return inode_idx_omp
+
+
 #--- Velocity contour plots
 def contour_vgrid_f0(ax, iphi, inode, f0_f, vpara=np.linspace(-4,4,29), vperp=np.linspace(0,4,33), title="", use_log=False, draw_contour=False, **kwargs):
     if f0_f.ndim ==4:
@@ -217,6 +235,26 @@ def contour_vgrid_f0(ax, iphi, inode, f0_f, vpara=np.linspace(-4,4,29), vperp=np
     else:
         _f = f0_f[:,inode,:]
         print(f"'iphi' {iphi} is given, but it seems that toroidally averaged f0_f is given. So ignoring 'iphi'")
+
+    if use_log:
+        title = title+" (log)"
+        cntr = ax.contourf(vpara, vperp, np.log(_f[:,:]), **kwargs)
+    else:
+        cntr = ax.contourf(vpara, vperp, _f[:,:], **kwargs)
+        
+    plt.colorbar(cntr)
+    cntr.colorbar.formatter.set_powerlimits((0,0))
+    ax.set_xlabel('vpara')
+    ax.set_ylabel('vperp')
+    ax.set_title(title)
+    
+    if draw_contour:
+        levels=[1e-2,1e-1,1e0,1e1,1e2]
+        cs = ax.contour(vpara, vperp, _f[:,:], levels=levels, colors='white', linewidths=1.5)
+        ax.clabel(cs, fmt="%.2f", colors='white', fontsize=10)
+
+def contour_vgrid_f0_only_node(ax, f0_f_target, vpara=np.linspace(-4,4,29), vperp=np.linspace(0,4,33), title="", use_log=False, draw_contour=False, **kwargs):
+    _f = f0_f_target # [iperp, ipara]
 
     if use_log:
         title = title+" (log)"
@@ -353,9 +391,301 @@ def deg2rad(deg):
 def rad2deg(rad):
     return rad * 180 / np.pi
 
+def normalize_to_pi(angle): # maps angle (radian) onto (-pi, pi]
+    return np.arctan2(np.sin(angle), np.cos(angle))
+
 def get_dist(pt1,pt2):
     return np.sqrt((pt1[0]-pt2[0])**2 + (pt1[1]-pt2[1])**2)
 
+#--- Mesh relevant points (for SOL profiles)
+def insert_level_point_on_line(
+    f,                         # callable: f(r_array, z_array) -> array (vectorized; wrap if needed)
+    r0, z0, theta, dist_fwd, dist_bwd,
+    r_line, z_line,            # existing points along the same line (ascending in s)
+    level=1.0, M=2001, atol=1e-10
+):
+    c, s = np.cos(theta), np.sin(theta)
+
+    # 1) dense param along the line
+    S = np.linspace(-dist_bwd, dist_fwd, M)
+    R = r0 + S*c
+    Z = z0 + S*s
+
+    # 2) evaluate and look for crossing of f-level
+    vals = f(R, Z)
+    g = vals - level
+
+    # exact hit on the grid?
+    hit = np.where(np.isclose(g, 0.0, atol=atol))[0]
+    if hit.size:
+        Sstar = S[hit[0]]
+    else:
+        # sign-change brackets
+        sign = np.sign(g)
+        sc_idx = np.where(sign[:-1] * sign[1:] < 0)[0]
+        if sc_idx.size == 0:
+            # no crossing; nothing to insert
+            return r_line, z_line, None
+
+        # pick the crossing closest to s=0 (change policy if you prefer first/last)
+        candidates = []
+        for i in sc_idx:
+            # 3) linear interpolation for the root inside [S[i], S[i+1]]
+            S0, S1 = S[i], S[i+1]
+            g0, g1 = g[i], g[i+1]
+            Sx = S0 - g0 * (S1 - S0) / (g1 - g0)
+            candidates.append(Sx)
+        Sstar = min(candidates, key=lambda t: abs(t))
+
+    # compute (r*, z*)
+    r_star = r0 + Sstar*c
+    z_star = z0 + Sstar*s
+
+    # 4) insert into your existing (r_line, z_line) in order of s
+    # recover s for current points
+    S_line = (r_line - r0)*c + (z_line - z0)*s
+    # if already present (within tolerance), skip
+    if np.any(np.isclose(S_line, Sstar, atol=1e-12)):
+        return r_line, z_line, (r_star, z_star)
+
+    k = np.searchsorted(S_line, Sstar)
+    r_ins = np.insert(r_line, k, r_star)
+    z_ins = np.insert(z_line, k, z_star)
+    return r_ins, z_ins, (r_star, z_star)
+
+import matplotlib.tri as mtri
+from shapely.geometry import LineString
+from shapely.ops import unary_union
+
+#--- helpes
+def _seg_seg_intersection(p0, p1, a, b, eps=1e-12):
+    """Return t in [0,1] along p0->p1 where the segment intersects a->b; None if no hit."""
+    p0 = np.asarray(p0); p1 = np.asarray(p1); a = np.asarray(a); b = np.asarray(b)
+    r = p1 - p0; s = b - a
+    den = r[0]*s[1] - r[1]*s[0]
+    if abs(den) < eps:
+        return None
+    ap  = a - p0
+    t   = (ap[0]*s[1] - ap[1]*s[0]) / den
+    u   = (ap[0]*r[1] - ap[1]*r[0]) / den
+    if -eps <= t <= 1+eps and -eps <= u <= 1+eps:
+        return float(np.clip(t, 0.0, 1.0))
+    return None
+
+def find_polyline_intersections(x1, y1, x2, y2):
+    """
+    Finds all geometric intersection points between two polylines.
+    
+    Args:
+        x1, y1: Coordinates of the first polyline (arrays).
+        x2, y2: Coordinates of the second polyline (arrays).
+        
+    Returns:
+        intersections: List of (x, y) tuples representing intersection points.
+    """
+    x1 = np.asarray(x1); y1 = np.asarray(y1)
+    x2 = np.asarray(x2); y2 = np.asarray(y2)
+    
+    intersections = []
+    
+    # Iterate over all segments in Line 1
+    for i in range(len(x1) - 1):
+        p0 = np.array([x1[i], y1[i]])
+        p1 = np.array([x1[i+1], y1[i+1]])
+        
+        # Iterate over all segments in Line 2
+        for j in range(len(x2) - 1):
+            a = np.array([x2[j], y2[j]])
+            b = np.array([x2[j+1], y2[j+1]])
+            
+            t = _seg_seg_intersection(p0, p1, a, b)
+            
+            if t is not None:
+                # Calculate the physical intersection point
+                # Point = p0 + t * (p1 - p0)
+                int_pt = p0 + t * (p1 - p0)
+                
+                # Deduplication:
+                # If an intersection occurs exactly at a vertex (e.g., t=1 of segment i 
+                # and t=0 of segment i+1), we might find it twice.
+                # We check if this point is effectively the same as the last one found.
+                if intersections:
+                    if np.linalg.norm(int_pt - intersections[-1]) < 1e-9:
+                        continue
+                
+                intersections.append(tuple(int_pt))
+                
+    return intersections
+
+def line_edge_hits(tri, p0, p1):
+    """
+    Compute the EXACT intersection points of the line with mesh edges,
+    and return interpolated values there (plus endpoints).
+    Useful to build piecewise integrations without bias from uneven cell sizes.
+    """
+    # collect t where the line hits any edge
+    edges = tri.edges
+    ts = [0.0, 1.0]
+    for i, j in edges:
+        t = _seg_seg_intersection(p0, p1, (tri.x[i], tri.y[i]), (tri.x[j], tri.y[j]))
+        if t is not None:
+            ts.append(t)
+            
+    ts = np.unique(np.clip(ts, 0.0, 1.0))
+    xs = p0[0] + (p1[0] - p0[0]) * ts
+    ys = p0[1] + (p1[1] - p0[1]) * ts
+    s  = np.hypot(*(np.array(p1) - np.array(p0))) * ts
+
+    return s, xs, ys
+
+def line_contour_hits_tri(tri, z, p0, p1, level):
+    """
+    Intersections of the line segment p0->p1 with the tricontour at `level`.
+    Returns s (arclength), x, y sorted along the segment.
+    """
+    # 1) build isoline(s); use allsegs (portable across mpl versions)
+    # cs = plt.tricontour(tri, z, levels=[level])
+    # segs = cs.allsegs[0]                    # list of (N,2) arrays (x,y)
+    # plt.close(cs.figure)
+    tmp_fig, tmp_ax = plt.subplots()
+    cs = tmp_ax.tricontour(tri, z, levels=[level])
+    segs = cs.allsegs[0] if cs.allsegs else []
+    plt.close(tmp_fig)  # closes only the temp fig
+
+    if not segs:
+        return np.empty(0), np.empty(0), np.empty(0)
+
+    # 2) union of polylines
+    contour = unary_union([LineString(seg) for seg in segs if len(seg) >= 2])
+
+    # 3) intersect with the line segment
+    cut = LineString([p0, p1])
+    inter = cut.intersection(contour)
+
+    pts = []
+    if inter.is_empty:
+        pass
+    elif inter.geom_type == "Point":
+        pts = [inter]
+    elif inter.geom_type == "MultiPoint":
+        pts = list(inter.geoms)
+    elif inter.geom_type in ("LineString", "MultiLineString"):
+        # overlapping case: take segment endpoints as "intersections"
+        geoms = getattr(inter, "geoms", [inter])
+        for g in geoms:
+            a, b = g.boundary.geoms
+            pts += [a, b]
+
+    if not pts:
+        return np.empty(0), np.empty(0), np.empty(0)
+
+    # 4) param along p0->p1
+    L  = np.hypot(p1[0]-p0[0], p1[1]-p0[1])
+    dx = p1[0]-p0[0]; dy = p1[1]-p0[1]
+    t  = ((np.array([p.x for p in pts]) - p0[0])*dx +
+          (np.array([p.y for p in pts]) - p0[1])*dy) / (L**2)
+    t  = np.clip(t, 0, 1)
+    order = np.argsort(t)
+    t = t[order]
+    x = p0[0] + t*dx
+    y = p0[1] + t*dy
+    s = t*L
+    return s, x, y
+
+def unique_xy_exact(x, y):
+    xy = np.column_stack([x, y])                            # shape (N,2)
+    _, idx = np.unique(xy, axis=0, return_index=True)       # first indices kept
+    keep = np.sort(idx)                                     # preserve input order
+    return x[keep], y[keep], keep
+
+def unique_xy_tol(x, y, tol=1e-9):
+    xy = np.column_stack([x, y])
+    q  = np.round(xy / tol).astype(np.int64)                # quantized keys
+    _, idx = np.unique(q, axis=0, return_index=True)
+    keep = np.sort(idx)
+    return x[keep], y[keep], keep
+
+#--- main API
+# !!! Setting specific for a run !!! TODO: clear this AD-HOC 
+#isurf_sol = [92,93,94,96,98,100]       # for old DIII-D run
+isurf_sol = [103,104,105,107,109,111,113,115,117,119,121]  # for new DIII-D run
+
+def sample_line_grid_relevant(x, r_line, z_line, psin_min=1.0):
+    # start main logic
+    p0 = [r_line[0], z_line[0]]
+    p1 = [r_line[-1], z_line[-1]]
+
+    x_mesh_relevant = np.array([], dtype=float)
+    y_mesh_relevant = np.array([], dtype=float)
+ 
+    if psin_min < 1.0:
+        isep = np.argmin(abs(x.mesh.psi_surf - x.psix))
+        for i in range(np.argmin(abs(x.mesh.psi_surf/x.psix - psin_min)), isep):
+            _, xtmp, ytmp = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=x.mesh.psi_surf[i]/x.psix); 
+            x_mesh_relevant = np.append(x_mesh_relevant, xtmp); 
+            y_mesh_relevant = np.append(y_mesh_relevant, ytmp)
+   
+    # append flux surfaces in SOL
+    for i in range(len(isurf_sol)):
+        _, xtmp, ytmp = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=x.mesh.psi_surf[isurf_sol[i]]/x.psix); 
+        x_mesh_relevant = np.append(x_mesh_relevant, xtmp); 
+        y_mesh_relevant = np.append(y_mesh_relevant, ytmp)
+
+    # remove redundant points
+    x_mesh_relevant, y_mesh_relevant, _ = unique_xy_tol(x_mesh_relevant, y_mesh_relevant, tol=1e-4)
+
+    return x_mesh_relevant, y_mesh_relevant
+
+def sample_line_grid_relevant_incl_unstruc(x, r_line, z_line, psin_min=1.0):
+    # !!! Setting specific for a run !!!
+    isurf_sep         = np.argmin(abs(x.mesh.psi_surf - x.psix))
+    isurf_unstruc_min = isurf_sep - 1
+    isurf_unstruc_max = isurf_sep + 1
+
+    # start main logic
+    p0 = [r_line[0], z_line[0]]
+    p1 = [r_line[-1], z_line[-1]]
+
+    x_mesh_relevant = np.array([], dtype=float)
+    y_mesh_relevant = np.array([], dtype=float)
+
+    # 1) add inner surfaces
+    if psin_min < x.mesh.psi_surf[isurf_unstruc_min]/x.psix:
+        for i in range(np.argmin(abs(x.mesh.psi_surf/x.psix - psin_min)), isurf_unstruc_min):
+            _, xtmp, ytmp = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=x.mesh.psi_surf[i]/x.psix); 
+            x_mesh_relevant = np.append(x_mesh_relevant, xtmp); 
+            y_mesh_relevant = np.append(y_mesh_relevant, ytmp)
+    
+    # 2) add unstruc part
+    _, x_unstruc_min, y_unstruc_min = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=x.mesh.psi_surf[isurf_unstruc_min]/x.psix);
+
+    if len(x_unstruc_min) == 0: # at least to start from the separatrix
+        _, x_unstruc_min, y_unstruc_min = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=1.0)
+        
+        # use the given point when possible !!! (the logic seems not so appropriate) !!!
+        if x_unstruc_min > p0[0]:
+            x_unstruc_min[0] = p0[0]
+            y_unstruc_min[0] = p0[1]
+        
+    if len(x_unstruc_min) == 0: # still zero?
+        _, x_unstruc_min, y_unstruc_min = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=1.0+1e-4)
+    _, x_unstruc_max, y_unstruc_max = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=x.mesh.psi_surf[isurf_unstruc_max]/x.psix);
+
+    # keep edge-crossing points in unstructured mesh region
+    _, xtmp, ytmp = line_edge_hits(x.mesh.triobj, (x_unstruc_min[0], y_unstruc_min[0]), (x_unstruc_max[0], y_unstruc_max[0]))
+    x_mesh_relevant = np.append(x_mesh_relevant, xtmp); 
+    y_mesh_relevant = np.append(y_mesh_relevant, ytmp)
+
+    # 3) append flux surfaces in SOL
+    for i in range(len(isurf_sol)):
+        _, xtmp, ytmp = line_contour_hits_tri(x.mesh.triobj, x.mesh.psi/x.psix, p0, p1, level=x.mesh.psi_surf[isurf_sol[i]]/x.psix); 
+        x_mesh_relevant = np.append(x_mesh_relevant, xtmp); 
+        y_mesh_relevant = np.append(y_mesh_relevant, ytmp)
+
+    # remove redundant points
+    x_mesh_relevant, y_mesh_relevant, _ = unique_xy_tol(x_mesh_relevant, y_mesh_relevant, tol=1e-4)
+
+    return x_mesh_relevant, y_mesh_relevant
 
 #--- Eich fit
 def eich(xdata,q0,s,lq,dsep):
